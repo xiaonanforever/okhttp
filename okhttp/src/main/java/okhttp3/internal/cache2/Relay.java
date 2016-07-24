@@ -27,20 +27,23 @@ import static okhttp3.internal.Util.closeQuietly;
 
 /**
  * Replicates a single upstream source into multiple downstream sources. Each downstream source
- * returns the same bytes as the upstream source. Downstream sources may read data immediately as it
- * is returned by upstream, or long after the upstream source has been exhausted.
+ * returns the same bytes as the upstream source. Downstream sources may read data either as it
+ * is returned by upstream, or after the upstream source has been exhausted.
  *
  * <p>As bytes are returned from upstream they are written to a local file. Downstream sources read
  * from this file as necessary.
+ *
+ * <p>This class also keeps a small buffer of bytes recently read from upstream. This is intended to
+ * save a small amount of file I/O and data copying.
  */
 // TODO(jwilson): what to do about timeouts? They could be different and unfortunately when any
 //     timeout is hit we like to tear down the whole stream.
-final class SourceRelay {
+final class Relay {
   private static final int SOURCE_UPSTREAM = 1;
   private static final int SOURCE_FILE = 2;
 
-  private static final ByteString PREFIX_CLEAN = ByteString.encodeUtf8("OkHttp cache v1\n");
-  private static final ByteString PREFIX_DIRTY = ByteString.encodeUtf8("OkHttp DIRTY :(\n");
+  static final ByteString PREFIX_CLEAN = ByteString.encodeUtf8("OkHttp cache v1\n");
+  static final ByteString PREFIX_DIRTY = ByteString.encodeUtf8("OkHttp DIRTY :(\n");
   private static final long FILE_HEADER_SIZE = 32L;
 
   /**
@@ -90,7 +93,7 @@ final class SourceRelay {
    */
   private int sourceCount;
 
-  private SourceRelay(RandomAccessFile file, Source upstream, long upstreamPos, ByteString metadata,
+  private Relay(RandomAccessFile file, Source upstream, long upstreamPos, ByteString metadata,
       long bufferMaxSize) {
     this.file = file;
     this.upstream = upstream;
@@ -101,23 +104,51 @@ final class SourceRelay {
   }
 
   /**
-   * Creates a new source relay that reads a live stream from {@code upstream}, using {@code file}
-   * to share that data with other sources.
+   * Creates a new relay that reads a live stream from {@code upstream}, using {@code file} to share
+   * that data with other sources.
    *
    * <p><strong>Warning:</strong> callers to this method must immediately call {@link #newSource} to
    * create a source and close that when they're done. Otherwise a handle to {@code file} will be
    * leaked.
    */
-  public static SourceRelay edit(
+  public static Relay edit(
       File file, Source upstream, ByteString metadata, long bufferMaxSize) throws IOException {
     RandomAccessFile randomAccessFile = new RandomAccessFile(file, "rw");
-    SourceRelay result = new SourceRelay(randomAccessFile, upstream, 0L, metadata, bufferMaxSize);
+    Relay result = new Relay(randomAccessFile, upstream, 0L, metadata, bufferMaxSize);
 
     // Write a dirty header. That way if we crash we won't attempt to recover this.
     randomAccessFile.setLength(0L);
     result.writeHeader(PREFIX_DIRTY, -1L, -1L);
 
     return result;
+  }
+
+  /**
+   * Creates a relay that reads a recorded stream from {@code file}.
+   *
+   * <p><strong>Warning:</strong> callers to this method must immediately call {@link #newSource} to
+   * create a source and close that when they're done. Otherwise a handle to {@code file} will be
+   * leaked.
+   */
+  public static Relay read(File file) throws IOException {
+    RandomAccessFile randomAccessFile = new RandomAccessFile(file, "rw");
+    FileOperator fileOperator = new FileOperator(randomAccessFile.getChannel());
+
+    // Read the header.
+    Buffer header = new Buffer();
+    fileOperator.read(0, header, FILE_HEADER_SIZE);
+    ByteString prefix = header.readByteString(PREFIX_CLEAN.size());
+    if (!prefix.equals(PREFIX_CLEAN)) throw new IOException("unreadable cache file");
+    long upstreamSize = header.readLong();
+    long metadataSize = header.readLong();
+
+    // Read the metadata.
+    Buffer metadataBuffer = new Buffer();
+    fileOperator.read(FILE_HEADER_SIZE + upstreamSize, metadataBuffer, metadataSize);
+    ByteString metadata = metadataBuffer.readByteString();
+
+    // Return the result.
+    return new Relay(randomAccessFile, null, upstreamSize, metadata, 0L);
   }
 
   private void writeHeader(
@@ -150,7 +181,7 @@ final class SourceRelay {
     file.getChannel().force(false);
 
     // This file is complete.
-    synchronized (SourceRelay.this) {
+    synchronized (Relay.this) {
       complete = true;
     }
 
@@ -158,32 +189,8 @@ final class SourceRelay {
     upstream = null;
   }
 
-  /**
-   * Creates a source relay that reads a recorded stream from {@code file}.
-   *
-   * <p><strong>Warning:</strong> callers to this method must immediately call {@link #newSource} to
-   * create a source and close that when they're done. Otherwise a handle to {@code file} will be
-   * leaked.
-   */
-  public static SourceRelay read(File file) throws IOException {
-    RandomAccessFile randomAccessFile = new RandomAccessFile(file, "rw");
-    FileOperator fileOperator = new FileOperator(randomAccessFile.getChannel());
-
-    // Read the header.
-    Buffer header = new Buffer();
-    fileOperator.read(0, header, FILE_HEADER_SIZE);
-    ByteString prefix = header.readByteString(PREFIX_CLEAN.size());
-    if (!prefix.equals(PREFIX_CLEAN)) throw new IOException("unreadable cache file");
-    long upstreamSize = header.readLong();
-    long metadataSize = header.readLong();
-
-    // Read the metadata.
-    Buffer metadataBuffer = new Buffer();
-    fileOperator.read(FILE_HEADER_SIZE + upstreamSize, metadataBuffer, metadataSize);
-    ByteString metadata = metadataBuffer.readByteString();
-
-    // Return the result.
-    return new SourceRelay(randomAccessFile, null, upstreamSize, metadata, 0L);
+  boolean isClosed() {
+    return file == null;
   }
 
   public ByteString metadata() {
@@ -191,12 +198,12 @@ final class SourceRelay {
   }
 
   /**
-   * Returns a new source that returns the same bytes as upstream. Returns null if this relay source
-   * has been closed and no further sources are possible. In that case callers should retry after
-   * building a new source relay with {@link #read}.
+   * Returns a new source that returns the same bytes as upstream. Returns null if this relay has
+   * been closed and no further sources are possible. In that case callers should retry after
+   * building a new relay with {@link #read}.
    */
   public Source newSource() {
-    synchronized (SourceRelay.this) {
+    synchronized (Relay.this) {
       if (file == null) return null;
       sourceCount++;
     }
@@ -232,21 +239,21 @@ final class SourceRelay {
      * block until that read completes. It is possible to time out while waiting for that.
      */
     @Override public long read(Buffer sink, long byteCount) throws IOException {
-      if (sourcePos == -1L) throw new IllegalStateException("closed");
+      if (fileOperator == null) throw new IllegalStateException("closed");
 
       long upstreamPos;
       int source;
 
       selectSource:
-      synchronized (SourceRelay.this) {
+      synchronized (Relay.this) {
         // We need new data from upstream.
-        while (sourcePos == (upstreamPos = SourceRelay.this.upstreamPos)) {
+        while (sourcePos == (upstreamPos = Relay.this.upstreamPos)) {
           // No more data upstream. We're done.
           if (complete) return -1L;
 
           // Another thread is already reading. Wait for that.
           if (upstreamReader != null) {
-            timeout.waitUntilNotified(SourceRelay.this);
+            timeout.waitUntilNotified(Relay.this);
             continue;
           }
 
@@ -297,9 +304,9 @@ final class SourceRelay {
 
         // Append the upstream bytes to the file.
         fileOperator.write(
-            FILE_HEADER_SIZE + sourcePos, upstreamBuffer.clone(), upstreamBytesRead);
+            FILE_HEADER_SIZE + upstreamPos, upstreamBuffer.clone(), upstreamBytesRead);
 
-        synchronized (SourceRelay.this) {
+        synchronized (Relay.this) {
           // Append new upstream bytes into the buffer. Trim it to its max size.
           buffer.write(upstreamBuffer, upstreamBytesRead);
           if (buffer.size() > bufferMaxSize) {
@@ -307,14 +314,14 @@ final class SourceRelay {
           }
 
           // Now that the file and buffer have bytes, adjust upstreamPos.
-          SourceRelay.this.upstreamPos += upstreamBytesRead;
+          Relay.this.upstreamPos += upstreamBytesRead;
         }
 
         return bytesRead;
       } finally {
-        synchronized (SourceRelay.this) {
+        synchronized (Relay.this) {
           upstreamReader = null;
-          SourceRelay.this.notifyAll();
+          Relay.this.notifyAll();
         }
       }
     }
@@ -328,7 +335,7 @@ final class SourceRelay {
       fileOperator = null;
 
       RandomAccessFile fileToClose = null;
-      synchronized (SourceRelay.this) {
+      synchronized (Relay.this) {
         sourceCount--;
         if (sourceCount == 0) {
           fileToClose = file;
